@@ -6,7 +6,26 @@ import (
   "fmt"
   //"bytes"
   "io/ioutil"
+  "sync"
+  "time"
 )
+
+type SafeStringBoolMap struct {
+  strings map[string]bool
+  mut sync.Mutex
+}
+
+func (sbm *SafeStringBoolMap) set(title string) {
+  sbm.mut.Lock()
+  defer sbm.mut.Unlock()
+  sbm.strings[title] = true
+}
+
+func (sbm *SafeStringBoolMap) seen(title string) bool {
+  sbm.mut.Lock()
+  defer sbm.mut.Unlock()
+  return sbm.strings[title]
+}
 
 type MediaWikiResponse struct {
   Query map[string](map[string](map[string]interface{}))
@@ -17,9 +36,13 @@ func (mwr *MediaWikiResponse) childrenTitles() []string {
   childrenTitles := make([]string, 1)
   pages := mwr.Query["pages"]
   for _,v := range pages {
-    links := v["links"].([]interface{})
+    maybeLinks := v["links"]
+    if maybeLinks == nil {
+      continue
+    }
+    links := maybeLinks.([]interface{})
     fmt.Println(links)
-    for _,linkmap := range links {
+    for _, linkmap := range links {
       lm := linkmap.(map[string]interface{})
       childrenTitles = append(childrenTitles, lm["title"].(string))
     }
@@ -27,10 +50,7 @@ func (mwr *MediaWikiResponse) childrenTitles() []string {
   return childrenTitles
 }
 
-func visitTitle(title, continueParam, plcontinueParam string) {
-  childrenTitles := make([]string, 1)
-  fmt.Println("curr", title)
-
+func makeURL(title, continueParam, plcontinueParam string) string {
   req, _ := http.NewRequest("GET", "http://en.wikipedia.org/w/api.php", nil)
   q := req.URL.Query()
   q.Add("action", "query")
@@ -44,48 +64,58 @@ func visitTitle(title, continueParam, plcontinueParam string) {
     q.Add("plcontinue", plcontinueParam)
   }
   req.URL.RawQuery = q.Encode()
+  return req.URL.String()
+}
 
-  println(req.URL.String())
-
-  res, err := http.Get(req.URL.String())
+func visitTitle(title, continueParam, plcontinueParam string, sbm *SafeStringBoolMap) {
+  if continueParam == "||" {
+    fmt.Println("continued")
+  }
+  url := makeURL(title, continueParam, plcontinueParam)
+  if sbm.seen(url) {
+    fmt.Println(url)
+    return
+  }
+  fmt.Println("curr", title)
+  sbm.set(url)
+  res, err := http.Get(url)
   println(res.StatusCode)
-  if err != nil {
+  if err != nil{
     println("error")
     println(err)
     return
   }
+  if res.StatusCode != 200 {
+    fmt.Println("Got status code ", res.StatusCode)
+    return
+  }
+
   defer res.Body.Close()
   body, err := ioutil.ReadAll(res.Body)
-  var topLevelMap map[string]interface{}
   var mediaWikiResponse MediaWikiResponse
-  err = json.Unmarshal(body, &topLevelMap)
-  fmt.Println(topLevelMap)
   err = json.Unmarshal(body, &mediaWikiResponse)
-  fmt.Println(mediaWikiResponse)
   if err != nil {
     fmt.Println("unmarshall failed: ", err)
   }
-  //fmt.Println(topLevelMap)
 
-  pages := topLevelMap["query"].(map[string]interface{})["pages"].(map[string]interface{})
-  //fmt.Println(pages)
-  for _,v := range pages {
-    m := v.(map[string]interface{})
-    links := m["links"].([]interface{})
-    //fmt.Println(links)
-    for _,linkmap := range links {
-      lm := linkmap.(map[string]interface{})
-      childrenTitles = append(childrenTitles, lm["title"].(string))
-    }
-  }
-  fmt.Println(childrenTitles)
+  childrenTitles := mediaWikiResponse.childrenTitles()
   for _, childTitle := range childrenTitles {
     if childTitle != "" {
-      //visitTitle(childTitle, "", "")
+      go visitTitle(childTitle, "", "", sbm)
     }
+  }
+
+  if mediaWikiResponse.Continue != nil {
+    fmt.Println("yo", title, mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"])
+    go visitTitle(title, mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"], sbm)
   }
 }
 
 func main() {
-  visitTitle("Albert Einstein", "", "")
+  sbm := SafeStringBoolMap{strings: make(map[string]bool)}
+  visitTitle("Albert Einstein", "||", "736|0|Action-angle_variables", &sbm)
+  for {
+    ch := time.After(10)
+    <-ch
+  }
 }
