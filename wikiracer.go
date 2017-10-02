@@ -8,6 +8,7 @@ import (
   "io/ioutil"
   "sync"
   "time"
+  "golang.org/x/time/rate"
 )
 
 type SafeStringBoolMap struct {
@@ -67,10 +68,7 @@ func makeURL(title, continueParam, plcontinueParam string) string {
   return req.URL.String()
 }
 
-func visitTitle(title, continueParam, plcontinueParam string, sbm *SafeStringBoolMap) {
-  if continueParam == "||" {
-    fmt.Println("continued")
-  }
+func enqueueRequest(title, continueParam, plcontinueParam string, sbm *SafeStringBoolMap, requestCh chan <- string) {
   url := makeURL(title, continueParam, plcontinueParam)
   if sbm.seen(url) {
     fmt.Println(url)
@@ -78,14 +76,25 @@ func visitTitle(title, continueParam, plcontinueParam string, sbm *SafeStringBoo
   }
   fmt.Println("curr", title)
   sbm.set(url)
+
+  requestCh <- url
+}
+
+func visitURL(url string, sbm *SafeStringBoolMap, requestCh chan <- string) {
   res, err := http.Get(url)
   println(res.StatusCode)
   if err != nil{
-    println("error")
-    println(err)
+    fmt.Println("error")
+    fmt.Println(err)
     return
   }
-  if res.StatusCode != 200 {
+
+  retryStatusCodes := map[int]bool{403: true, 429: true, 502: true}
+
+  if _, ok := retryStatusCodes[res.StatusCode]; ok {
+    fmt.Printf("Got status code %d, should retry...\n", res.StatusCode)
+    return
+  } else if res.StatusCode != 200 {
     fmt.Println("Got status code ", res.StatusCode)
     return
   }
@@ -101,19 +110,31 @@ func visitTitle(title, continueParam, plcontinueParam string, sbm *SafeStringBoo
   childrenTitles := mediaWikiResponse.childrenTitles()
   for _, childTitle := range childrenTitles {
     if childTitle != "" {
-      go visitTitle(childTitle, "", "", sbm)
+      go enqueueRequest(childTitle, "", "", sbm, requestCh)
     }
   }
 
   if mediaWikiResponse.Continue != nil {
     fmt.Println("yo", title, mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"])
-    go visitTitle(title, mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"], sbm)
+    go enqueueRequest(title, mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"], sbm, requestCh)
+  }
+}
+
+func processRequestQueue(requestCh chan string, sbm *SafeStringBoolMap) {
+  rateLimiter := rate.NewLimiter(1000, 50)
+  for {
+    url := <-requestCh
+    rateLimiter.Allow()
+    go visitURL(url, sbm, requestCh)
   }
 }
 
 func main() {
   sbm := SafeStringBoolMap{strings: make(map[string]bool)}
-  visitTitle("Albert Einstein", "||", "736|0|Action-angle_variables", &sbm)
+  requestCh := make(chan string, 1024)
+  enqueueRequest("Albert Einstein", "", "", &sbm, requestCh)
+  processRequestQueue(requestCh, &sbm)
+
   for {
     ch := time.After(10)
     <-ch
