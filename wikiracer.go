@@ -13,46 +13,32 @@ import (
   "os"
   "log"
   "strings"
+  "flag"
+  "github.com/oleiade/lane"
 )
 
 type Wikiracer struct {
   startTitle string
   endTitle string
-  requester *Requester
+  requester *GetRequester
   sbm *SafeStringBoolMap
+  queueProcessors int
 }
 
-func NewWikiracer(startTitle, endTitle string, requester *Requester,
-  sbm *SafeStringBoolMap) *Wikiracer {
+func NewWikiracer(startTitle, endTitle string, requester *GetRequester,
+  sbm *SafeStringBoolMap, queueProcessors int) *Wikiracer {
 
-  return &Wikiracer{startTitle: startTitle, endTitle: endTitle, requester: requester, sbm: sbm}
+  return &Wikiracer{startTitle: startTitle, endTitle: endTitle, requester: requester, sbm: sbm,
+    queueProcessors: queueProcessors}
 }
 
-func (racer *Wikiracer) Race() {
-  startPage := &Page{title: racer.startTitle, childrenPages: make([]*Page, 1)}
-  pageCh := make(chan *Page, 10000)
-  pageCh <- startPage
-
-  fmt.Println(startPage)
-  for i := 0; i < 5; i++ {
-    go racer.ProcessPageQueue(pageCh)
-  }
-}
-
-func (racer *Wikiracer) ProcessPageQueue(pageCh chan *Page) {
-  for p := range pageCh {
-    go racer.ProcessPage(p, pageCh)
-  }
-}
-
-func (racer *Wikiracer) ProcessPage(p *Page, pageCh chan *Page) {
-  racer.PopulateChildrenPages(p)
-  fmt.Println(len(pageCh), len(racer.sbm.strings), racer.requester.rateLimiter.Limit())
-  for _, childPage := range p.ChildrenPages() {
-    if childPage != nil && !racer.sbm.seen(childPage.title) {
-      pageCh <- childPage
-    }
-  }
+// Creates a request with the start title, and issues a mediawiki request from there.
+// That media wiki request will make several other requests, which will be processed by the
+// Requester's queue
+func (racer *Wikiracer) Race(resultCh chan []string) {
+  startPage := NewPage(racer.startTitle, nil, 0)
+  req := racer.createRequest(racer.startTitle, "", "")
+  racer.IssueMediaWikiRequest(req, startPage, "", "", resultCh)
 }
 
 type SafeStringBoolMap struct {
@@ -86,7 +72,6 @@ func (mwr *MediaWikiResponse) childrenTitles() []string {
       continue
     }
     links := maybeLinks.([]interface{})
-    //fmt.Println(links)
     for _, linkmap := range links {
       lm := linkmap.(map[string]interface{})
       childrenTitles = append(childrenTitles, lm["title"].(string))
@@ -95,90 +80,58 @@ func (mwr *MediaWikiResponse) childrenTitles() []string {
   return childrenTitles
 }
 
-type ErrorShouldRetry struct {
-  s string
-}
-
-func (err *ErrorShouldRetry) Error() string {
-  return err.s
-}
-
 type Page struct {
   title string
-  childrenPages []*Page
+  parent *Page
   lock sync.RWMutex
-  donePopulating bool
+  depth int
 }
 
-func (p *Page) AddChildrenTitles(titles []string) {
-  p.lock.Lock()
-  defer p.lock.Unlock()
-  for _, title := range titles {
-    if title != "" {
-      childPage := &Page{title: title, childrenPages: make([]*Page, 1)}
-      p.childrenPages = append(p.childrenPages, childPage)
-    }
-  }
+func NewPage(title string, parent *Page, depth int) *Page {
+  return &Page{title: title, parent: parent, depth: depth}
 }
 
-func (p *Page) ChildrenPages() []*Page {
-  p.lock.RLock()
-  defer p.lock.RUnlock()
-  return p.childrenPages
-}
-
-func (racer *Wikiracer) PopulateChildrenPages(p *Page) {
-  continueParam := ""
-  plcontinueParam := ""
-
-  for !p.donePopulating {
-    done := make(chan struct{})
-    req := createRequest(p.title, continueParam, plcontinueParam)
-
-    racer.requester.Request(req, done, func(res *http.Response, err error) {
-      continueParamCandidate, plcontinueParamCandidate, err := racer.handleMediaWikiResponse(p, continueParam,
-        plcontinueParam, res, err)
-      if err == nil {
-        continueParam = continueParamCandidate
-        plcontinueParam = plcontinueParamCandidate
-        p.donePopulating = continueParam == ""
-      }
-    })
-
-    <-done
-  }
-}
 
 type RequestWithResponseChan struct {
   req         *http.Request
   resCallback func(*http.Response, error)
-  // done struct if request is to be done sync wrt caller
-  done chan <- struct{}
 }
 
-type Requester struct {
+// A requester will isue get requests
+type GetRequester struct {
   rateLimiter *SafeRateLimiter
-  // tuples of request, response channel
-  requestCh chan *RequestWithResponseChan
+  // priority queue of RequestWithResponseChan objects
+  requestPQ *lane.PQueue
 }
 
-func NewRequester(rateLimit rate.Limit, burst, chanSize, queueProcessors int) *Requester {
-  requester := &Requester{
+// Creates a Requester, which is used to make HTTP Get requests at some rate limit.
+// It handles its own internal priority queue for getting requests
+func NewRequester(rateLimit rate.Limit, burst, queueProcessors int) *GetRequester {
+  requester := &GetRequester{
     rateLimiter: &SafeRateLimiter{rateLimiter: rate.NewLimiter(rateLimit, burst)},
-    requestCh: make(chan *RequestWithResponseChan, chanSize),
+    requestPQ: lane.NewPQueue(lane.MINPQ),
   }
 
   // Process the queue of requests while respecting the rate limiter
   for i := 0; i < queueProcessors; i++ {
-    go func(requester *Requester){
+    go func(requester *GetRequester){
       for {
-        reqWithResCallback := <-requester.requestCh
-        reservation := requester.rateLimiter.ReserveN(time.Now(), 1)
+        requests := make([]*RequestWithResponseChan, 0)
+        numRequests := 0
+        for numRequests < burst && requester.requestPQ.Size() != 0 {
+          reqWithResCallbackInterface, _ := requester.requestPQ.Pop()
+          if reqWithResCallbackInterface != nil {
+            reqWithResCallback := reqWithResCallbackInterface.(*RequestWithResponseChan)
+            requests = append(requests, reqWithResCallback)
+            numRequests++
+          }
+        }
+        reservation := requester.rateLimiter.ReserveN(time.Now(), numRequests)
         time.Sleep(reservation.Delay())
-        res, err := http.Get(reqWithResCallback.req.URL.String())
-        reqWithResCallback.resCallback(res, err)
-        if reqWithResCallback.done != nil {
-          reqWithResCallback.done <- struct{}{}
+        for i := 0; i < numRequests; i++ {
+          reqWithResCallback := requests[i]
+          res, err := http.Get(reqWithResCallback.req.URL.String())
+          reqWithResCallback.resCallback(res, err)
         }
       }
     }(requester)
@@ -187,10 +140,10 @@ func NewRequester(rateLimit rate.Limit, burst, chanSize, queueProcessors int) *R
   return requester
 }
 
-func (requester *Requester) Request(req *http.Request, done chan <- struct{},
-  resCallback func(*http.Response, error)) {
-
-  requester.requestCh <- &RequestWithResponseChan{req: req, resCallback: resCallback, done: done}
+// Push a request and its callback onto the priority queue
+func (requester *GetRequester) Request(req *http.Request, priority int, resCallback func(*http.Response, error)) {
+  reqWithResChan := &RequestWithResponseChan{req: req, resCallback: resCallback}
+  requester.requestPQ.Push(reqWithResChan, priority)
 }
 
 type SafeRateLimiter struct {
@@ -210,7 +163,9 @@ func (limiter *SafeRateLimiter) ReserveN(t time.Time, n int) *rate.Reservation {
   return limiter.rateLimiter.ReserveN(t, n)
 }
 
-func createRequest(title, continueParam, plcontinueParam string) *http.Request {
+// Given a title, continueParam, and plcontinueParam (specific keys to the media wiki request)
+// return a usable *http.Request object with those params.
+func (racer *Wikiracer) createRequest(title, continueParam, plcontinueParam string) *http.Request {
   req, _ := http.NewRequest("GET", "http://en.wikipedia.org/w/api.php", nil)
   q := req.URL.Query()
   q.Add("action", "query")
@@ -227,61 +182,102 @@ func createRequest(title, continueParam, plcontinueParam string) *http.Request {
   return req
 }
 
-func (racer *Wikiracer) handleMediaWikiResponse(p *Page, continueParam, plcontinueParam string,
-  res *http.Response, err error) (string, string, error) {
+// Creates a request, with retry logic. Will also make requests for the children media wiki responses
+// One very important factor to this algorithm is the priority of the request, which is the depth
+// of the link in our BFS. We want to prioritize short links and not deep links, which could get us
+// too far down the rabbit hole and wasting precious time
+func (racer *Wikiracer) IssueMediaWikiRequest(req *http.Request, p *Page, continueParam,
+  plcontinueParam string, resultCh chan []string) {
 
-  if strings.Contains(strings.ToLower(p.title), strings.ToLower(racer.endTitle)) {
+  if strings.ToLower(p.title) == strings.ToLower(racer.endTitle) {
     fmt.Printf("Reached title %s !! :)\n", racer.endTitle)
-    os.Exit(0)
+
+    path := make([]string, 0)
+    currPage := p
+    for currPage != nil {
+      path = append(path, currPage.title)
+      currPage = currPage.parent
+    }
+    for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+      path[i], path[j] = path[j], path[i]
+    }
+    resultCh <- path
+    return
   }
 
-  retryStatusCodes := map[int]bool{403: true, 429: true, 502: true}
+  racer.requester.Request(req, p.depth, func(res *http.Response, err error) {
+    retryStatusCodes := map[int]bool{403: true, 429: true, 502: true}
+    if err != nil{
+      fmt.Println("error")
+      fmt.Println(err)
+      racer.IssueMediaWikiRequest(req, p, continueParam, plcontinueParam, resultCh)
+      return
+    } else if _, ok := retryStatusCodes[res.StatusCode]; ok {
+      fmt.Printf("Got status code %d, should retry...\n", res.StatusCode)
+      racer.IssueMediaWikiRequest(req, p, continueParam, plcontinueParam, resultCh)
+      return
+    } else if res.StatusCode != 200 {
+      fmt.Println("Got status code ", res.StatusCode)
+      racer.IssueMediaWikiRequest(req, p, continueParam, plcontinueParam, resultCh)
+      return
+    }
 
-  if err != nil{
-    fmt.Println("error")
-    fmt.Println(err)
-    return "", "", err
-  } else if _, ok := retryStatusCodes[res.StatusCode]; ok {
-    fmt.Printf("Got status code %d, should retry...\n", res.StatusCode)
-    return "", "", fmt.Errorf("Got status code %d, should retry...", res.StatusCode)
-  } else if res.StatusCode != 200 {
-    fmt.Println("Got status code ", res.StatusCode)
-    return "", "", fmt.Errorf("Got status code %d", res.StatusCode)
-  }
+    racer.sbm.set(p.title)
 
-  racer.sbm.set(p.title)
+    defer res.Body.Close()
+    body, err := ioutil.ReadAll(res.Body)
+    var mediaWikiResponse MediaWikiResponse
+    err = json.Unmarshal(body, &mediaWikiResponse)
+    if err != nil {
+      fmt.Println("unmarshall failed: ", err)
+    }
 
-  defer res.Body.Close()
-  body, err := ioutil.ReadAll(res.Body)
-  var mediaWikiResponse MediaWikiResponse
-  err = json.Unmarshal(body, &mediaWikiResponse)
-  if err != nil {
-    fmt.Println("unmarshall failed: ", err)
-  }
+    childrenTitles := mediaWikiResponse.childrenTitles()
+    for _, childTitle := range childrenTitles {
+      req := racer.createRequest(childTitle, "", "")
+      childPage := NewPage(childTitle, p, p.depth + 1)
+      go racer.IssueMediaWikiRequest(req, childPage, "", "", resultCh)
+    }
 
-  childrenTitles := mediaWikiResponse.childrenTitles()
-  p.AddChildrenTitles(childrenTitles)
-
-  if mediaWikiResponse.Continue != nil {
-    return mediaWikiResponse.Continue["continue"], mediaWikiResponse.Continue["plcontinue"], nil
-  } else {
-    return "", "", nil
-  }
+    if mediaWikiResponse.Continue != nil {
+      req := racer.createRequest(p.title, mediaWikiResponse.Continue["continue"],
+        mediaWikiResponse.Continue["plcontinue"])
+      go racer.IssueMediaWikiRequest(req, p, mediaWikiResponse.Continue["continue"],
+        mediaWikiResponse.Continue["plcontinue"], resultCh)
+    }
+  })
 }
 
 func main() {
+  // Allows for live profiling via http://localhost:6060/debug/pprof. Use go tool pprof <url>
   go func() {
     log.Println(http.ListenAndServe("localhost:6060", nil))
   }()
 
-  runtime.GOMAXPROCS(2)
+  startTitle := flag.String("start", "", "The title to start at ")
+  endTitle := flag.String("end", "", "The title to end at ")
+  numProc := flag.Int("num_proc", runtime.NumCPU(), "Number of processors to use")
+  mediaWikiRateLimit := flag.Float64("rate_limit", 60, "Rate limit to use on the media wiki api")
+  mediaWikiBurst := flag.Int("burst", 50, "Burst to use for the media wiki api")
+  flag.Parse()
 
+  runtime.GOMAXPROCS(*numProc)
+
+  resultCh := make(chan []string)
   sbm := SafeStringBoolMap{strings: make(map[string]bool)}
-  requester := NewRequester(100, 50, 10000, 3)
-  racer := NewWikiracer("Football", "Team Sports", requester, &sbm)
-  racer.Race()
+  requester := NewRequester(rate.Limit(*mediaWikiRateLimit), *mediaWikiBurst, 5000)
+  racer := NewWikiracer(*startTitle, *endTitle, requester, &sbm, 10)
+  racer.Race(resultCh)
 
+  // Wait for the result
   for {
-    time.Sleep(1000)
+    select {
+    case path := <-resultCh:
+      fmt.Printf("The path to get from %s to %s is\n", *startTitle, *endTitle)
+      fmt.Println(path)
+      os.Exit(0)
+      return
+    case <-time.After(1 * time.Second):
+    }
   }
 }

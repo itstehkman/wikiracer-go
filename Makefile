@@ -1,8 +1,6 @@
 
-run: install
-	wikiracer
-
-install:
+install: get
 	go install
 
-
+get:
+	go get
